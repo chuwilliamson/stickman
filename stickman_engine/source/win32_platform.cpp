@@ -3,9 +3,11 @@
 #ifdef PLATFORM_WIN32
 
 #include <Windows.h>
-#include<stdint.h>
+#include <stdint.h>
+#include <gl\GL.h>
+#include <Shlwapi.h>
 #include "win32_platform.h"
-#include "win32_clock.h"
+#include "engineAPI.h"
 #include "win32_io.h"
 
 using namespace stickman_engine;
@@ -47,11 +49,38 @@ namespace stickman_engine
 		_windowHandle = nullptr;
 	}
 
+	void win32_platform::initGL(HWND window)
+	{
+		HDC winDC = GetDC(window);
+
+		PIXELFORMATDESCRIPTOR pixelFormat = {};
+		pixelFormat.nSize = sizeof(pixelFormat);
+		pixelFormat.nVersion = 1;
+		pixelFormat.dwFlags = PFD_SUPPORT_OPENGL | PFD_DRAW_TO_WINDOW | PFD_DOUBLEBUFFER;
+		pixelFormat.cColorBits = 32;
+		pixelFormat.cAlphaBits = 8;
+		pixelFormat.iPixelType = PFD_TYPE_RGBA;
+		pixelFormat.iLayerType = PFD_MAIN_PLANE;
+
+		int pixelFormatIndex = ChoosePixelFormat(winDC, &pixelFormat);
+		PIXELFORMATDESCRIPTOR suggestedPixelFormat = {};
+		DescribePixelFormat(winDC, pixelFormatIndex, sizeof(suggestedPixelFormat), &suggestedPixelFormat);
+		SetPixelFormat(winDC, pixelFormatIndex, &suggestedPixelFormat);
+
+		HGLRC glDC = wglCreateContext(winDC);
+		if (!wglMakeCurrent(winDC, glDC))
+		{
+			// TODO: LogError. Unable to initialize opengl
+		}
+
+		ReleaseDC(window, winDC);
+	}
+
 	bool win32_platform::init()
 	{
-		// Use default size for now
-		int32_t winW = 0;
-		int32_t winH = 0;
+		// Use default size for now (half 1920x1080 so we don't have to deal with aspect ratio
+		int32_t winW = 960;
+		int32_t winH = 540;
 
 		// Define the window
 		WNDCLASS windowClass = {};
@@ -66,6 +95,9 @@ namespace stickman_engine
 		windowClass.lpszClassName = "stickmanWindow";
 		//windowClass.hIcon = TODO Create ICON
 
+		RECT windowRect = { 0, 0, winW, winH };
+		AdjustWindowRect(&windowRect, WS_OVERLAPPEDWINDOW, false);
+
 		if (RegisterClass(&windowClass))
 		{
 			// Create the window
@@ -76,8 +108,8 @@ namespace stickman_engine
 				WS_OVERLAPPEDWINDOW | WS_VISIBLE,
 				CW_USEDEFAULT,
 				CW_USEDEFAULT,
-				(winW != 0) ? winW : CW_USEDEFAULT,
-				(winW != 0) ? winW : CW_USEDEFAULT,
+				windowRect.right - windowRect.left,
+				windowRect.bottom - windowRect.top,
 				0,
 				0,
 				windowClass.hInstance,
@@ -88,6 +120,8 @@ namespace stickman_engine
 				// TODO: Logging unable to create window
 				return false;
 			}
+
+			initGL(_windowHandle);
 
 			// Embed a pointer to the win32_platform instance so we can process the
 			// win proc function in a object oriented way
@@ -117,15 +151,18 @@ namespace stickman_engine
 		_gameMemory.persistantStorage = VirtualAlloc(baseAddress, _gameMemory.persistantStorageSize + _gameMemory.transientStorageSize, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
 		_gameMemory.transientStorage = (uint8_t *)(_gameMemory.persistantStorage) + _gameMemory.persistantStorageSize;
 
-		// Create and initialize the clock
-		_gameClock = new win32_clock();
-		_gameClock->init();
+		// Create and initialize the platform API object
+		platform_io * pIO = new platform_io();
+		pIO->writeFile = Win32PlatformWriteFile;
+		pIO->readFile = Win32PlatformReadFile;
 
-		// Create and initialize the gameIO object
-		_gameIO = new win32_io();
+		assembly_info *assInfo = new assembly_info();
+		createAssemblyInfo(assInfo);
+
+		engineAPI *engine = new engineAPI(pIO, assInfo);
 
 		// Initialize the game code
-		if (_gameCode.load(&_gameMemory, _gameIO) == false)
+		if (_gameCode.load(&_gameMemory, engine) == false)
 		{
 			// TODO: Error unable to load gamecode
 			return false;
@@ -137,6 +174,27 @@ namespace stickman_engine
 	void win32_platform::run()
 	{
 		_isRunning = true;
+
+		// We first need to determine the performance frequency
+		int64_t clockFrequency = 0;
+		int64_t currentTime, currentCycles;
+		{
+			LARGE_INTEGER queryTime = {};
+			if (QueryPerformanceFrequency(&queryTime))
+			{
+				// TODO: Logging Query Performance Failed! Your clock will not work"
+				clockFrequency = queryTime.QuadPart;
+			}
+
+			// Initialize the time
+			QueryPerformanceCounter(&queryTime);
+			currentTime = queryTime.QuadPart;
+
+			// Initialize the cycles
+			currentCycles = __rdtsc();
+		}
+
+
 		while (_isRunning == true)
 		{
 			// Paint the back buffer to the screen
@@ -159,7 +217,43 @@ namespace stickman_engine
 			HDC deviceContext = GetDC(_windowHandle);
 			paintWindow(deviceContext);
 			ReleaseDC(_windowHandle, deviceContext);
+
+			// *******
+			// Frame Stats
+			// *******
+			int64_t oldTime = currentTime;
+			int64_t oldCycles = currentCycles;
+
+			// Grab the processor cycles
+			currentCycles = __rdtsc();
+
+			LARGE_INTEGER queryTime;
+			QueryPerformanceCounter(&queryTime);
+			currentTime = queryTime.QuadPart;
+
+			int64_t elapsedTicks = currentTime - oldTime;
+			int64_t frameKiloCycles = (currentCycles - oldCycles) / 1000;
+			int64_t framesPerSecond = clockFrequency / elapsedTicks;
+			double frameElapsedMS = ((1000 * (elapsedTicks)) / double(clockFrequency));
+
+			char buffer[256];
+			wsprintf(buffer, "Milliseconds/frame: %dms. FPS: %d. Kilocycles/frame: %d\n", (int32_t)frameElapsedMS, (int32_t)framesPerSecond, (int32_t)frameKiloCycles);
+			OutputDebugStringA(buffer);
 		}
+	}
+
+	void win32_platform::createAssemblyInfo(assembly_info *assInfo)
+	{
+		char exePath[MAX_PATH];
+		GetModuleFileNameA(nullptr, exePath, MAX_PATH);
+		if (!PathRemoveFileSpec(exePath))
+		{
+			// TODO: Log ERROR unable to create exe path;
+			return;
+		}
+
+		assInfo->exeFilePath = std::string(exePath) + "\\";
+		assInfo->dataPath = assInfo->exeFilePath + "data\\";
 	}
 
 	void win32_platform::paintWindow(HDC deviceContext)
@@ -173,6 +267,58 @@ namespace stickman_engine
 			&_bitmapInfo,
 			DIB_RGB_COLORS,			// DIB section will not use a palette
 			SRCCOPY);				// copy the src to the dest
+
+		// Remove the bitblt and uncomment this for GL (although this will not use the buffer from stickman, just a test)
+		//glViewport(0, 0, _clientWidth, _clientHeight);
+
+		//static GLuint textureHandle = 0;
+		//static bool init = false;
+		//if (!init)
+		//{
+		//	glGenTextures(1, &textureHandle);
+		//	init = true;
+		//}
+
+		//glBindTexture(GL_TEXTURE_2D, textureHandle);
+		//glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, _backBuffer.width, _backBuffer.height, 0, GL_BGRA_EXT, GL_UNSIGNED_BYTE, _backBuffer.memory);
+		//glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_MODULATE);
+
+		//glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+		//glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+		//glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP);
+		//glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP);
+
+		//glEnable(GL_TEXTURE_2D);
+
+		//glClearColor(1.0f, 0.0f, 0.0f, 0.0f);
+		//glClear(GL_COLOR_BUFFER_BIT);
+
+		//glMatrixMode(GL_MODELVIEW); // Dont care right now
+		//glLoadIdentity();
+
+		//glMatrixMode(GL_PROJECTION);
+		//glLoadIdentity();
+
+		//glBegin(GL_TRIANGLES);
+
+		//int originX = (int)_clientWidth / 2;
+		//int originY = (int)_clientHeight / 2;
+
+		//float p = 1.0f * .9f;
+	
+		//glTexCoord2f(0.0f, 0.0f);
+		//glVertex2f(-p, -p);
+	
+		//glTexCoord2f(0.0f, 1.0f);
+		//glVertex2f(-p, p);
+
+		//glTexCoord2f(1.0f, 1.0f);
+		//glVertex2f(p, p);
+
+
+		//glEnd();
+
+		//SwapBuffers(deviceContext);
 	}
 
 
